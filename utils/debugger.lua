@@ -1,7 +1,6 @@
 ------------------------------------------------------------
 -- logger.lua
 -- Made by https://github.com/MizaruWareCC
--- Original github repo: https://github.com/MizaruWareCC/Lua-Debugger
 ------------------------------------------------------------
 ---@diagnostic disable: deprecated
 
