@@ -52,7 +52,7 @@ function Extended_table:contains(value, recursive, seen)
     return false
 end
 
---- @param out Extended_table
+--- @param out? table | Extended_table
 --- @param seen? table | Extended_table
 function Extended_table:deep_copy(out, seen)
     out = out or Extended_table.new()

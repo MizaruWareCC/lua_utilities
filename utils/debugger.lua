@@ -269,7 +269,6 @@ function Debugger:_register_table_name(t, name)
     end
 end
 
--- wrap a real table into a proxy that logs and recursively wraps child tables
 --- @param real table
 --- @param name string
 function Debugger:_wrap_table(real, name)
