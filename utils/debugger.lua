@@ -1,0 +1,494 @@
+------------------------------------------------------------
+-- logger.lua
+-- Made by https://github.com/MizaruWareCC
+-- Original github repo: https://github.com/MizaruWareCC/Lua-Debugger
+------------------------------------------------------------
+---@diagnostic disable: deprecated
+
+local Enums = {
+    --- @enum Actions
+    actions = {
+        READ = 1,
+        WRITE = 2,
+        CALL = 3,
+        HOOK_FUNCTION = 4
+    }
+}
+
+--- @class Params
+--- @field actions? Actions
+--- @field debug? boolean
+--- @field log_file? string
+
+--- @class LogData
+--- @field action Actions
+--- @field time number
+--- @field table table | Extended_table
+--- @field key any
+--- @field value any
+--- @field fname string
+--- @field arguments table | Extended_table
+--- @field result any
+--- @field ok boolean
+--- @field change_type string
+--- @field new_value any
+--- @field old_value any
+
+--- @class BuiltinOverride
+--- @field fname string
+--- @field original function
+--- @field changed function
+
+---@class Debugger
+---@field params Params
+---@field _log_data LogData
+---@field _builtin_overrides BuiltinOverride
+---@field _hooked_functions table | Extended_table
+---@field _is_wrapper table | Extended_table
+---@field _ENV table | Extended_table
+---@field _ENV_PROXY table | Extended_table
+---@field _table_names table | Extended_table
+---@field _table_proxies table | Extended_table
+---@field _proxy_to_real table | Extended_table
+---@field _custom_fn function
+local Debugger = {}
+Debugger.__index = Debugger
+Debugger.__call = function (_, ...)
+    return Debugger.new(...)
+end
+
+-- utility: check if value is present in a list-like table
+local function table_contains(tbl, value)
+    if type(tbl) ~= "table" then return false end
+    for _, v in pairs(tbl) do
+        if v == value then
+            return true
+        end
+    end
+    return false
+end
+
+local function deepcopy(orig, copies) -- http://lua-users.org/wiki/CopyTable
+    copies = copies or {}
+    local orig_type = type(orig)
+    local copy
+    if orig_type == 'table' then
+        if copies[orig] then
+            copy = copies[orig]
+        else
+            copy = {}
+            copies[orig] = copy
+            for orig_key, orig_value in next, orig, nil do
+                copy[deepcopy(orig_key, copies)] = deepcopy(orig_value, copies)
+            end
+            setmetatable(copy, deepcopy(getmetatable(orig), copies))
+        end
+    else -- number, string, boolean, etc
+        copy = orig
+    end
+    return copy
+end
+
+local function actind_to_str(index)
+    if index == Enums.actions.READ then return "READ"
+    elseif index == Enums.actions.WRITE then return "WRITE"
+    elseif index == Enums.actions.CALL then return "CALL"
+    elseif index == Enums.actions.HOOK_FUNCTION then return "HOOK FUNCTION"
+    else return tostring(index)
+    end
+end
+
+--- @param params? Params
+--- @return Debugger
+function Debugger.new(params)
+    params = params or {}
+    if params.debug == nil then params.debug = true end
+    ---@diagnostic disable-next-line: assign-type-mismatch
+    params.actions = params.actions or {Enums.actions.READ, Enums.actions.WRITE, Enums.actions.CALL, Enums.actions.HOOK_FUNCTION}
+
+    local self = setmetatable({
+        params = params,
+        _log_data = {}, -- LogData
+        _builtin_overrides = {}, -- BuiltinOverride
+        _hooked_functions = {}, -- map: original_function -> wrapper_function
+        _is_wrapper = {}, -- set: wrapper_function -> true
+        _ENV = deepcopy(_G), -- real sandbox environment
+        _ENV_PROXY = nil, -- proxy for _ENV; created in _prepare_env
+        _table_names = setmetatable({}, { __mode = "k" }), -- weak-key registry for names
+        _table_proxies = setmetatable({}, { __mode = "k" }), -- real -> proxy
+        _proxy_to_real = setmetatable({}, { __mode = "k" }), -- proxy -> real
+        _custom_fn = nil, -- function to be ran before executing hooked function
+    }, Debugger)
+
+    -- register common names
+    self._table_names[self._ENV] = "_ENV"
+    self._table_names[_G] = "_G"
+
+    return self
+end
+
+local function join_values(tbl)
+    if not tbl then return "" end
+    local s = ""
+    for i, v in ipairs(tbl) do
+        s = s .. tostring(v)
+        if i < #tbl then s = s .. ", " end
+    end
+    return s
+end
+
+--- @param t table | Extended_table
+--- @return table
+function Debugger:_get_real(t)
+    return self._proxy_to_real[t] or t
+end
+
+--- @param t table | Extended_table
+--- @return string
+function Debugger:_get_tablename(t)
+    local real = self:_get_real(t)
+
+    if self._table_names[real] then return self._table_names[real] end
+    
+    return tostring(real)
+end
+
+--- @param entry LogData
+function Debugger:_format_action(entry)
+    -- entry: { action, time, table, key, value, old_value, new_value, fname, arguments, result, ok, change_type, ... }
+    local info
+    if entry.action == Enums.actions.READ then
+        info = string.format("Reading from %s with key %s, got data: %s (type: %s)",
+            self:_get_tablename(entry.table), tostring(entry.key), tostring(entry.value), type(entry.value))
+    elseif entry.action == Enums.actions.WRITE then
+        if entry.change_type == "update" then
+            info = string.format("Updating key %s in %s: old=%s -> new=%s (type: %s)",
+                tostring(entry.key), self:_get_tablename(entry.table), tostring(entry.old_value),
+                tostring(entry.new_value), type(entry.new_value))
+        else
+            info = string.format("Writing new key %s to %s: value=%s (type: %s)",
+                tostring(entry.key), self:_get_tablename(entry.table), tostring(entry.value), type(entry.value))
+        end
+    elseif entry.action == Enums.actions.CALL then
+        local args_summary = join_values(entry.arguments)
+        info = string.format("Calling from %s with callable name %s and arguments [%s]",
+            self:_get_tablename(entry.table), tostring(entry.fname), args_summary)
+    elseif entry.action == Enums.actions.HOOK_FUNCTION then
+        local args_summary = join_values(entry.arguments)
+        local result_summary = join_values(entry.result)
+        local status = entry.ok and "OK" or "ERR"
+        info = string.format("Hooked function %s called on %s: args=[%s] -> result=[%s] (%s)",
+            tostring(entry.fname), self:_get_tablename(entry.table), args_summary, result_summary, status)
+    else
+        info = "Unresolved action"
+    end
+    return string.format("Action %s at %.4fS: %s", actind_to_str(entry.action), tonumber(entry.time) or 0, info)
+end
+
+function Debugger:_save_actions()
+    local f = self.params.log_file
+    if f then
+        local file, err = io.open(f, "w")
+        if not file then
+            error("Couldn't open file for writing: " .. tostring(err))
+        end
+        local text_version = ""
+        for _, data in ipairs(self._log_data) do
+            text_version = text_version .. self:_format_action(data) .. "\n"
+        end
+        file:write(text_version)
+        file:close()
+        return true
+    end
+    return false
+end
+
+--- @param action number
+--- @param info table | Extended_table
+function Debugger:_log_action(action, info)
+    local entry = { action = action, time = os.clock() }
+    if type(info) == "table" then
+        for k, v in pairs(info) do entry[k] = v end
+    end
+    table.insert(self._log_data, entry)
+
+    if self.params.debug then
+        local ok, err = pcall(function() print(self:_format_action(entry)) end)
+        if not ok then
+            io.stderr:write("Logger:_format_action error: " .. tostring(err) .. "\n")
+        end
+    end
+end
+
+--- @param fname string
+--- @return integer | nil
+function Debugger:_find_override(fname)
+    for i, d in ipairs(self._builtin_overrides) do
+        if d.fname == fname then
+            return i
+        end
+    end
+    return nil
+end
+
+-- Override builtin function
+-- - fname: function name to override
+-- - callable: function to be replaced with
+--- @param fname string
+--- @param callable function
+function Debugger:builtin_override(fname, callable)
+    local i = self:_find_override(fname)
+    local orig = self._ENV[fname] or _G[fname]
+    if i then
+        self._builtin_overrides[i].changed = callable
+    else
+        table.insert(self._builtin_overrides, { fname = fname, original = orig, changed = callable })
+    end
+
+    rawset(self._ENV, fname, callable)
+end
+
+-- Restore original builtin function
+-- - fname: function name to restore
+--- @param fname string
+function Debugger:builtin_restore(fname)
+    local i = self:_find_override(fname)
+    if i then
+        local orig = self._builtin_overrides[i].original
+        rawset(self._ENV, fname, orig)
+        table.remove(self._builtin_overrides, i)
+    end
+end
+
+--- @param t table | Extended_table
+--- @param name string
+function Debugger:_register_table_name(t, name)
+    if type(t) ~= "table" then return end
+    if not self._table_names[t] then
+        self._table_names[t] = name or tostring(t)
+    end
+end
+
+-- wrap a real table into a proxy that logs and recursively wraps child tables
+--- @param real table
+--- @param name string
+function Debugger:_wrap_table(real, name)
+    if type(real) ~= "table" then return real end
+    if self._table_proxies[real] then
+        return self._table_proxies[real]
+    end
+
+    local proxy = {}
+    self._table_proxies[real] = proxy
+    self._proxy_to_real[proxy] = real
+
+    if name then self:_register_table_name(real, name) end
+
+    local meta = {}
+
+    meta.__index = function(_, k)
+        local v = rawget(real, k)
+        if self.params.actions and table_contains(self.params.actions, Enums.actions.READ) then
+            self:_log_action(Enums.actions.READ, { table = real, key = k, value = v })
+        end
+        if type(v) == "table" then
+            return self:_wrap_table(v, (self._table_names[real] or tostring(real)) .. "." .. tostring(k))
+        else
+            return v
+        end
+    end
+
+    meta.__newindex = function(t, k, v)
+        local old = rawget(real, k)
+        local had_old = old ~= nil
+
+        if self._proxy_to_real[v] then
+            v = self._proxy_to_real[v]
+        end
+
+        if type(v) == "function" and table_contains(self.params.actions, Enums.actions.HOOK_FUNCTION) then
+            local cached_wrapper = self._hooked_functions[v]
+            if cached_wrapper then
+                v = cached_wrapper
+            elseif not self._is_wrapper[v] then
+                local orig = v
+                local key_name = tostring(k)
+                local wrapper = function(...)
+                    if self._custom_fn then -- run custom set callback
+                        if self._custom_fn(table.pack(...), key_name, self:_get_tablename(t)) == false then -- false -> don't execute following function
+                            return
+                        end
+                    end
+                    local args = { ... }
+                    local call_results = { pcall(orig, table.unpack(args)) }
+                    local ok = table.remove(call_results, 1)
+                    self:_log_action(Enums.actions.HOOK_FUNCTION, {
+                        table = real,
+                        fname = key_name,
+                        arguments = args,
+                        result = call_results,
+                        ok = ok
+                    })
+                    if ok then
+                        return table.unpack(call_results)
+                    else
+                        error(call_results[1])
+                    end
+                end
+                self._hooked_functions[orig] = wrapper
+                self._is_wrapper[wrapper] = true
+                v = wrapper
+            end
+        end
+
+        if type(v) == "table" then
+            local parent_name = self:_get_tablename(real)
+            local child_name = tostring(k)
+            self:_register_table_name(v, parent_name .. "." .. child_name)
+        end
+
+        if had_old then
+            self:_log_action(Enums.actions.WRITE, { table = real, key = k, old_value = old, new_value = v, change_type = "update" })
+        else
+            self:_log_action(Enums.actions.WRITE, { table = real, key = k, value = v, change_type = "new" })
+        end
+
+        rawset(real, k, v)
+    end
+
+    meta.__pairs = function()
+        return function(tbl, idx)
+            local k, v = next(real, idx)
+            if k == nil then return nil end
+            if type(v) == "table" then
+                return k, self:_wrap_table(v, (self._table_names[real] or tostring(real)) .. "." .. tostring(k))
+            else
+                return k, v
+            end
+        end, proxy, nil
+    end
+
+    meta.__call = function(_, ...)
+        local f = rawget(real, "__fn")
+        if type(f) == "function" then
+            local args = { ... }
+            if self.params.actions and table_contains(self.params.actions, Enums.actions.CALL) then
+                self:_log_action(Enums.actions.CALL, { table = real, fname = tostring(real), arguments = args })
+            end
+            return f(table.unpack(args))
+        end
+        return nil
+    end
+
+    setmetatable(proxy, meta)
+    return proxy
+end
+
+--- @param tbl table | Extended_table
+--- @param recursive boolean
+--- @param visited? table | Extended_table
+function Debugger:_set_custom_fn(tbl, recursive, visited)
+    visited = visited or {}
+    if visited[tbl] then return end
+    visited[tbl] = true
+
+    for k, v in pairs(tbl) do
+        if type(v) == "function" and not self._is_wrapper[v] then
+            local orig = v
+            local wrapper = function(...)
+                if self._custom_fn then
+                    if self._custom_fn(table.pack(...), tostring(k), self:_get_tablename(tbl)) == false then
+                        return
+                    end
+                end
+                local call_results = { pcall(orig, ...) }
+                local ok = table.remove(call_results, 1)
+                self:_log_action(Enums.actions.HOOK_FUNCTION, {
+                    table = tbl,
+                    fname = tostring(k),
+                    arguments = { ... },
+                    result = call_results,
+                    ok = ok
+                })
+                if ok then
+                    return table.unpack(call_results)
+                else
+                    error(call_results[1])
+                end
+            end
+            self._hooked_functions[orig] = wrapper
+            self._is_wrapper[wrapper] = true
+            tbl[k] = wrapper
+        elseif type(v) == "table" and recursive then
+            self:_set_custom_fn(v, true, visited)
+        end
+    end
+end
+
+
+function Debugger:_prepare_env()
+    if table_contains(self.params.actions, Enums.actions.HOOK_FUNCTION) then
+        self:_set_custom_fn(self._ENV, true)
+    end
+    if not self._ENV or type(self._ENV) ~= "table" then
+        self._ENV = deepcopy(_G)
+    end
+    self._ENV_PROXY = self:_wrap_table(self._ENV, "_ENV")
+end
+
+--- @param fn function
+function Debugger:set_custom_callback(fn)
+    self._custom_fn = fn
+end
+
+--- @param runnable function | string
+function Debugger:run(runnable)
+    assert(type(runnable) == "string" or type(runnable) == "function")
+    self:_prepare_env()
+        
+    local code = type(runnable) == "function" and runnable() or runnable
+    if load then
+        local fn, err = load(code, "LoggerChunk", "t", self._ENV_PROXY)
+        if not fn then
+            print("ERROR compiling code:", tostring(err))
+            return false
+        end
+        local ok, res = pcall(fn)
+        if ok then
+            print("DEBUGGER: finished executing code")
+            self:_save_actions()
+            return true
+        else
+            print("ERROR:", res)
+            self:_save_actions()
+            return false
+        end
+    elseif loadstring then
+        ---@diagnostic disable-next-line: param-type-mismatch
+        local fn, err = loadstring(code)
+        if not fn then
+            print("ERROR compiling code:", tostring(err))
+            return false
+        end
+        if setfenv then
+            setfenv(fn, self._ENV_PROXY)
+        else
+            error("loadstring present but setfenv missing; cannot set environment for chunk")
+        end
+        local ok, res = pcall(fn)
+        if ok then
+            print("DEBUGGER: finished executing code")
+            self:_save_actions()
+            return true
+        else
+            print("ERROR:", res)
+            self:_save_actions()
+            return false
+        end
+    else
+        print("You don't have load or loadstring so we can't proceed")
+        return false
+    end
+end
+
+return Debugger
