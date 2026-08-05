@@ -7,8 +7,13 @@ local Class;
 
 Class = setmetatable({ }, {
 	---@param type string
-	__call = function(_, type) -- Class(type_name)
+	---@param protected_members { string: any}
+	__call = function(_, type, protected_members) -- Class(type_name)
 		local real = setmetatable({ __type = type }, { __index = Class }) -- fields in real, base methods in Class
+		protected_members = protected_members or { }
+		for k, v in pairs(protected_members) do
+			real[k] = v
+		end
 		local proxy = { }
 		local metatable = {
 			__index = function(_, k)

@@ -8,12 +8,13 @@ local check_type = mod.check_type
 ---@class TextMessage:Class
 ---@field message string
 ---@field __id MessageType
+---@field __is_private boolean
 local TextMessage = setmetatable({
 }, {
 	---@param message string
 	---@return TextMessage
 	__call = function(_, message)
-		local text_msg = Class("text_message")
+		local text_msg = Class("text_message", {__is_private = true})
 		text_msg.message = message
 		return text_msg
 	end
@@ -50,7 +51,7 @@ local imsg = Class("qwerty")
 ---@return string
 local function fmt_message(message)
 	if check_type(message, "text_message") then
-		return "[TEXT MESSAGE]: " .. message.message
+		return "[TEXT MESSAGE]: \"" .. message.message .. "\" is private: " .. tostring(message.__is_private)
 	elseif check_type(message, "video_message") then
 		return "[VIDEO MESSAGE]: [" .. table.concat(message.raw_bytes, ", ") .. "]"
 	end
@@ -60,7 +61,7 @@ end
 -- Tests
 assert(fmt_message(vmsg) == "[VIDEO MESSAGE]: [1, 2, 3, 4, 5]")
 assert(fmt_message(vmsg2) == "[VIDEO MESSAGE]: [2, 3, 125, 1254, 123]")
-assert(fmt_message(tmsg) == "[TEXT MESSAGE]: hello bob!")
+assert(fmt_message(tmsg) == "[TEXT MESSAGE]: \"hello bob!\" is private: true")
 
 local s, _ = pcall(fmt_message, imsg)
 assert(s == false)
