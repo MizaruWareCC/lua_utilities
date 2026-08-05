@@ -7,7 +7,7 @@ local Class;
 
 Class = setmetatable({ }, {
 	---@param type string
-	---@param protected_members { string: any}
+	---@param protected_members { string: any }
 	__call = function(_, type, protected_members) -- Class(type_name)
 		local real = setmetatable({ __type = type }, { __index = Class }) -- fields in real, base methods in Class
 		protected_members = protected_members or { }
